@@ -1,12 +1,43 @@
 alter table public.products
-  add column average_cost numeric(14, 2)
-    check (average_cost is null or average_cost >= 0),
-  add column reorder_level integer not null default 5
-    check (reorder_level between 0 and 1000000);
+  add column if not exists average_cost numeric(14, 2),
+  add column if not exists reorder_level integer not null default 5;
 
 alter table public.transaction_items
-  add column unit_cost numeric(14, 2)
-    check (unit_cost is null or unit_cost >= 0);
+  add column if not exists unit_cost numeric(14, 2);
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'products_average_cost_nonnegative_check'
+      and conrelid = 'public.products'::regclass
+  ) then
+    alter table public.products
+      add constraint products_average_cost_nonnegative_check
+      check (average_cost is null or average_cost >= 0);
+  end if;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'products_reorder_level_range_check'
+      and conrelid = 'public.products'::regclass
+  ) then
+    alter table public.products
+      add constraint products_reorder_level_range_check
+      check (reorder_level between 0 and 1000000);
+  end if;
+
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'transaction_items_unit_cost_nonnegative_check'
+      and conrelid = 'public.transaction_items'::regclass
+  ) then
+    alter table public.transaction_items
+      add constraint transaction_items_unit_cost_nonnegative_check
+      check (unit_cost is null or unit_cost >= 0);
+  end if;
+end;
+$$;
 
 with restock_costs as (
   select
@@ -22,7 +53,8 @@ with restock_costs as (
 update public.products as product
 set average_cost = restock_costs.total_cost / nullif(restock_costs.units_received, 0)
 from restock_costs
-where product.id = restock_costs.product_id;
+where product.id = restock_costs.product_id
+  and product.average_cost is null;
 
 update public.transaction_items as item
 set unit_cost = case
@@ -32,14 +64,15 @@ end
 from public.transactions as transaction_row
 cross join public.products as product
 where transaction_row.id = item.transaction_id
-  and product.id = item.product_id;
+  and product.id = item.product_id
+  and item.unit_cost is null;
 
 grant insert (business_id, location_id, name, category, unit_price, average_cost, reorder_level)
   on public.products to authenticated;
 grant update (name, category, unit_price, reorder_level)
   on public.products to authenticated;
 
-create function public.set_product_initial_cost(
+create or replace function public.set_product_initial_cost(
   target_product_id uuid,
   initial_unit_cost numeric
 )

@@ -1,7 +1,7 @@
 alter table public.products
-  add column archived_at timestamptz;
+  add column if not exists archived_at timestamptz;
 
-create function public.set_product_average_cost(
+create or replace function public.set_product_average_cost(
   target_product_id uuid,
   next_average_cost numeric
 )
@@ -44,7 +44,7 @@ $$;
 revoke all on function public.set_product_average_cost(uuid, numeric) from public, anon;
 grant execute on function public.set_product_average_cost(uuid, numeric) to authenticated;
 
-create function public.set_product_archived(
+create or replace function public.set_product_archived(
   target_product_id uuid,
   should_archive boolean
 )
@@ -88,7 +88,7 @@ $$;
 revoke all on function public.set_product_archived(uuid, boolean) from public, anon;
 grant execute on function public.set_product_archived(uuid, boolean) to authenticated;
 
-create function public.prevent_archived_product_transaction()
+create or replace function public.prevent_archived_product_transaction()
 returns trigger
 language plpgsql
 security definer
@@ -113,6 +113,18 @@ $$;
 
 revoke all on function public.prevent_archived_product_transaction() from public, anon, authenticated;
 
-create trigger transaction_items_reject_archived_products
-before insert on public.transaction_items
-for each row execute function public.prevent_archived_product_transaction();
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_trigger
+    where tgname = 'transaction_items_reject_archived_products'
+      and tgrelid = 'public.transaction_items'::regclass
+      and not tgisinternal
+  ) then
+    create trigger transaction_items_reject_archived_products
+    before insert on public.transaction_items
+    for each row execute function public.prevent_archived_product_transaction();
+  end if;
+end;
+$$;
