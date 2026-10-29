@@ -1,70 +1,93 @@
-import { callPaystack } from "@/lib/billing/paystack";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { createAuthenticatedServerClient } from "@/lib/supabase/server";
-
-const responseHeaders = { "Cache-Control": "no-store" };
+import { getPaystackSecret, isRecord, paystackRequest } from "@/lib/billing/paystack";
+import { createRequestClient } from "@/lib/supabase/server";
 
 function respond(message: string, status: number) {
-  return Response.json({ message }, { status, headers: responseHeaders });
+  return Response.json({ message }, { status, headers: { "Cache-Control": "no-store" } });
 }
 
 export async function POST(request: Request) {
   const origin = request.headers.get("origin");
-  if (origin && origin !== new URL(request.url).origin) {
-    return respond("This request is not allowed.", 403);
-  }
+  if (origin && origin !== new URL(request.url).origin) return respond("This request is not allowed.", 403);
 
-  let supabase;
+  let body: unknown;
   try {
-    supabase = await createAuthenticatedServerClient();
+    const text = await request.text();
+    if (text.length > 2048) return respond("Billing request is too large.", 413);
+    body = JSON.parse(text);
   } catch {
-    return respond("Supabase authentication is not configured on this server.", 503);
+    return respond("Send a valid billing request.", 400);
   }
-  const { data: authData, error: authError } = await supabase.auth.getUser();
-  if (authError?.name === "AuthSessionMissingError") return respond("Sign in to manage your subscription.", 401);
-  if (authError || !authData.user) return respond("Could not verify your account. Sign in again.", 401);
+  if (!isRecord(body) || typeof body.businessId !== "string" || !/^[0-9a-f-]{36}$/i.test(body.businessId)) {
+    return respond("Choose a valid business to manage billing for.", 400);
+  }
 
+  const supabase = await createRequestClient();
+  if (!supabase) return respond("Supabase authentication is not configured on this server.", 503);
+  const { data: authData, error: authError } = await supabase.auth.getUser();
+  if (authError || !authData.user) return respond("Sign in to manage your subscription.", 401);
+
+  const { data: business, error: businessError } = await supabase
+    .from("businesses")
+    .select("owner_id")
+    .eq("id", body.businessId)
+    .maybeSingle();
+  if (businessError || !business) return respond("Business not found or you do not have access.", 404);
+  if (business.owner_id !== authData.user.id) return respond("Only the business owner can manage this subscription.", 403);
+
+  const secret = getPaystackSecret();
+  if (!secret) return respond("Paystack is not configured on the server.", 503);
   let admin;
   try {
     admin = createAdminClient();
   } catch {
-    return respond("Subscription billing is not configured on this server.", 503);
+    return respond("Server-side Supabase billing is not configured.", 503);
   }
 
-  const { data: secret, error: secretError } = await admin
-    .from("paystack_subscription_secrets")
-    .select("subscription_code, email_token")
+  const { data: billing, error: billingError } = await admin
+    .from("owner_subscriptions")
+    .select("paystack_subscription_code, paystack_email_token, status, cancel_at_period_end")
     .eq("owner_id", authData.user.id)
     .maybeSingle();
-  if (secretError) return respond("Could not load automatic renewal settings.", 503);
-  if (!secret) return respond("Automatic renewal details are not ready yet. Try again after checkout completes.", 409);
-
-  try {
-    await callPaystack("/subscription/disable", {
-      method: "POST",
-      body: JSON.stringify({
-        code: secret.subscription_code,
-        token: secret.email_token,
-      }),
-    });
-  } catch (reason) {
-    return respond(reason instanceof Error ? reason.message : "Paystack could not cancel automatic renewal.", 502);
+  if (billingError || !billing) return respond("Subscription record not found.", 404);
+  if ((billing.status !== "active" && billing.status !== "past_due") || billing.cancel_at_period_end) {
+    return respond("There is no active renewal to cancel.", 409);
+  }
+  if (!billing.paystack_subscription_code || !billing.paystack_email_token) {
+    return respond("Paystack has not finished setting up subscription management. Try again shortly.", 409);
   }
 
+  try {
+    await paystackRequest("/subscription/disable", secret, {
+      code: billing.paystack_subscription_code,
+      token: billing.paystack_email_token,
+    });
+  } catch {
+    return respond("Paystack could not cancel renewal. Try again or contact support.", 502);
+  }
+
+  const wasPastDue = billing.status === "past_due";
   const { error: updateError } = await admin
-    .from("account_subscriptions")
-    .update({ auto_renew: false, updated_at: new Date().toISOString() })
+    .from("owner_subscriptions")
+    .update({
+      ...(wasPastDue ? {
+        status: "canceled",
+        cancel_at_period_end: false,
+        paystack_subscription_code: null,
+        paystack_email_token: null,
+        paystack_customer_code: null,
+        next_payment_date: null,
+      } : { cancel_at_period_end: true }),
+      checkout_reference: null,
+      checkout_url: null,
+      checkout_started_at: null,
+      checkout_email: null,
+      pending_plan_tier: null,
+      pending_plan_code: null,
+      updated_at: new Date().toISOString(),
+    })
     .eq("owner_id", authData.user.id);
-  if (updateError) return respond("Automatic renewal was cancelled, but the app could not refresh its status. Reload shortly.", 503);
+  if (updateError) return respond("Paystack accepted the cancellation, but the app could not update its billing status. The webhook will reconcile it shortly.", 503);
 
-  const { error: deleteError } = await admin
-    .from("paystack_subscription_secrets")
-    .delete()
-    .eq("owner_id", authData.user.id);
-  if (deleteError) return respond("Automatic renewal was cancelled, but its stored cancellation token could not be removed.", 503);
-
-  return Response.json(
-    { message: "Automatic renewal cancelled. Your current paid access remains available until its expiry date." },
-    { headers: responseHeaders },
-  );
+  return Response.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
 }

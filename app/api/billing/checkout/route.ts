@@ -1,10 +1,13 @@
-import { randomUUID } from "node:crypto";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { callPaystack, getString, isRecord } from "@/lib/billing/paystack";
-import { createAuthenticatedServerClient } from "@/lib/supabase/server";
-
-type CheckoutMode = "manual" | "automatic";
-type PlanTier = "single" | "multi";
+import { createRequestClient } from "@/lib/supabase/server";
+import {
+  activateSubscriptionFromReference,
+  getPaystackSecret,
+  isPlanTier,
+  isRecord,
+  paystackRequest,
+  PLAN_AMOUNTS_KOBO,
+} from "@/lib/billing/paystack";
 
 const responseHeaders = { "Cache-Control": "no-store" };
 
@@ -12,112 +15,205 @@ function respond(message: string, status: number) {
   return Response.json({ message }, { status, headers: responseHeaders });
 }
 
+function isPaystackAuthorizationUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && (url.hostname === "paystack.com" || url.hostname.endsWith(".paystack.com"));
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(request: Request) {
   const origin = request.headers.get("origin");
-  if (origin && origin !== new URL(request.url).origin) {
-    return respond("This request is not allowed.", 403);
-  }
+  if (origin && origin !== new URL(request.url).origin) return respond("This request is not allowed.", 403);
 
   let body: unknown;
   try {
-    const bodyText = await request.text();
-    if (bodyText.length > 1024) return respond("Checkout request is too large.", 413);
-    body = JSON.parse(bodyText);
+    const text = await request.text();
+    if (text.length > 2048) return respond("Billing request is too large.", 413);
+    body = JSON.parse(text);
   } catch {
-    return respond("Send a valid subscription checkout request.", 400);
+    return respond("Send a valid billing request.", 400);
   }
-  if (!isRecord(body) || (body.mode !== "manual" && body.mode !== "automatic") ||
-    (body.tier !== "single" && body.tier !== "multi")) {
-    return respond("Choose a valid monthly plan and payment method.", 400);
+  if (!isRecord(body) || typeof body.businessId !== "string" || !/^[0-9a-f-]{36}$/i.test(body.businessId)) {
+    return respond("Choose a valid business to manage billing for.", 400);
+  }
+  if (body.planTier !== undefined && !isPlanTier(body.planTier)) {
+    return respond("Choose a valid subscription plan.", 400);
   }
 
-  let supabase;
-  try {
-    supabase = await createAuthenticatedServerClient();
-  } catch {
-    return respond("Supabase authentication is not configured on this server.", 503);
-  }
+  const supabase = await createRequestClient();
+  if (!supabase) return respond("Supabase authentication is not configured on this server.", 503);
   const { data: authData, error: authError } = await supabase.auth.getUser();
-  if (authError?.name === "AuthSessionMissingError") return respond("Sign in to subscribe.", 401);
-  if (authError || !authData.user?.email) return respond("Could not verify your account. Sign in again.", 401);
+  if (authError || !authData.user) return respond("Sign in to manage your subscription.", 401);
+  if (!authData.user.email) return respond("Add and verify an email address before subscribing.", 400);
+
+  const { data: business, error: businessError } = await supabase
+    .from("businesses")
+    .select("id, owner_id")
+    .eq("id", body.businessId)
+    .maybeSingle();
+  if (businessError || !business) return respond("Business not found or you do not have access.", 404);
+  if (business.owner_id !== authData.user.id) return respond("Only the business owner can manage this subscription.", 403);
+
+  const { data: rows, error: summaryError } = await supabase.rpc("get_business_subscription_summary", {
+    target_business_id: body.businessId,
+  });
+  const summary = Array.isArray(rows) ? rows[0] : null;
+  if (summaryError || !isRecord(summary)) {
+    return respond("Subscription setup is not ready. Apply the latest Lokal Ledger Supabase migration and try again.", 503);
+  }
+  const status = summary.status;
+  const trialEndsAt = typeof summary.trial_ends_at === "string" ? Date.parse(summary.trial_ends_at) : 0;
+  if (status === "trialing" && trialEndsAt > Date.now()) {
+    return respond("Your free trial is still active. You can subscribe after it ends; no payment will be taken now.", 409);
+  }
+  const nextPaymentDate = typeof summary.next_payment_date === "string" ? Date.parse(summary.next_payment_date) : 0;
+  const endedCanceledPeriod = status === "active" && summary.cancel_at_period_end === true && nextPaymentDate > 0 && nextPaymentDate <= Date.now();
+  if (status === "active" && !endedCanceledPeriod) return respond("This subscription is already active.", 409);
+  if (status === "past_due") return respond("A previous recurring payment needs attention. Stop the failed plan before starting another subscription.", 409);
+  if (status !== "trialing" && status !== "canceled" && !endedCanceledPeriod) {
+    return respond("This account is not ready to start a subscription.", 409);
+  }
+
+  const branchCount = Number(summary.branch_count);
+  if (!Number.isSafeInteger(branchCount) || branchCount < 1) {
+    return respond("Add a business location before choosing a subscription.", 409);
+  }
+  const planTier = branchCount === 1 ? "single" : "multi";
+  if (body.planTier !== undefined && body.planTier !== planTier) {
+    return respond("Subscription pricing is based on the owner's registered branch count.", 409);
+  }
+  const planCode = (planTier === "single"
+    ? process.env.PAYSTACK_SINGLE_BRANCH_PLAN_CODE
+    : process.env.PAYSTACK_MULTI_BRANCH_PLAN_CODE)?.trim();
+  if (!planCode || !/^PLN_[A-Za-z0-9]+$/.test(planCode)) {
+    return respond(`Configure the Paystack ${planTier === "single" ? "single-branch" : "multi-branch"} monthly plan code on the server.`, 503);
+  }
+
+  const secret = getPaystackSecret();
+  if (!secret) return respond("Paystack is not configured. Add PAYSTACK_SECRET_KEY to the server environment.", 503);
+
+  let configuredPlan: Record<string, unknown>;
+  try {
+    configuredPlan = await paystackRequest(`/plan/${encodeURIComponent(planCode)}`, secret);
+  } catch {
+    return respond("Could not verify this Paystack plan code. Check that it belongs to the configured test/live account.", 503);
+  }
+  if (
+    configuredPlan.amount !== PLAN_AMOUNTS_KOBO[planTier] ||
+    configuredPlan.interval !== "monthly" ||
+    configuredPlan.currency !== "NGN"
+  ) {
+    return respond("The configured Paystack plan must be monthly, in NGN, and match the price shown in the app.", 503);
+  }
 
   let admin;
   try {
     admin = createAdminClient();
   } catch {
-    return respond("Subscription billing is not configured on this server.", 503);
+    return respond("Server-side Supabase billing is not configured. Add SUPABASE_SERVICE_ROLE_KEY on the server.", 503);
   }
 
-  const { count: businessCount, error: businessError } = await admin
-    .from("businesses")
-    .select("id", { count: "exact", head: true })
-    .eq("owner_id", authData.user.id);
-  if (businessError) return respond("Could not check the businesses on your account.", 503);
-  if (!businessCount) return respond("Create your first business before choosing a subscription.", 400);
+  const { data: existingCheckout, error: existingCheckoutError } = await admin
+    .from("owner_subscriptions")
+    .select("checkout_reference, checkout_url, checkout_started_at, pending_plan_tier")
+    .eq("owner_id", authData.user.id)
+    .maybeSingle();
+  if (existingCheckoutError || !existingCheckout) return respond("Could not check for an existing checkout. Try again shortly.", 503);
 
-  const mode = body.mode as CheckoutMode;
-  const tier = body.tier as PlanTier;
-  if (businessCount > 1 && tier !== "multi") {
-    return respond("An account managing multiple businesses must use the ₦5,000 plan.", 400);
-  }
+  let reference: string;
+  if (existingCheckout.checkout_reference) {
+    if (existingCheckout.pending_plan_tier !== planTier) {
+      return respond("A different Paystack checkout is already pending. Finish it before changing plans.", 409);
+    }
+    if (isPaystackAuthorizationUrl(existingCheckout.checkout_url)) {
+      return Response.json({ authorizationUrl: existingCheckout.checkout_url }, { headers: responseHeaders });
+    }
 
-  const amountKobo = tier === "multi" ? 500000 : 300000;
-  const planCode = mode === "automatic"
-    ? process.env[tier === "multi" ? "PAYSTACK_PLAN_MULTI" : "PAYSTACK_PLAN_SINGLE"]?.trim()
-    : undefined;
-  if (mode === "automatic" && !planCode) {
-    return respond(`Set the Paystack ${tier === "multi" ? "multi-business" : "single-business"} monthly plan code on the server first.`, 503);
-  }
-
-  const reference = `lokal-${randomUUID()}`;
-  const { error: checkoutError } = await admin.from("subscription_checkouts").insert({
-    reference,
-    owner_id: authData.user.id,
-    customer_email: authData.user.email.toLocaleLowerCase(),
-    plan_tier: tier,
-    billing_mode: mode,
-    amount_kobo: amountKobo,
-  });
-  if (checkoutError) {
-    return respond("Could not prepare your secure subscription checkout. Try again shortly.", 503);
+    reference = existingCheckout.checkout_reference;
+    try {
+      const verified = await paystackRequest(`/transaction/verify/${encodeURIComponent(reference)}`, secret);
+      if (verified.status === "success") {
+        const activated = await activateSubscriptionFromReference(admin, reference, secret);
+        return respond(
+          activated
+            ? "A previous Paystack payment was verified. Reload the workspace to refresh access."
+            : "Paystack reports a completed payment, but the plan could not be reconciled. Do not pay again; contact support.",
+          409,
+        );
+      }
+      if (["failed", "abandoned", "reversed"].includes(String(verified.status))) {
+        const replacementReference = `lokalledger-${crypto.randomUUID()}`;
+        const replacementStartedAt = new Date().toISOString();
+        const { data: replacement, error: replacementError } = await admin.rpc("reserve_owner_subscription_checkout", {
+          target_owner_id: authData.user.id,
+          target_reference: replacementReference,
+          target_started_at: replacementStartedAt,
+          target_email: authData.user.email,
+          target_plan_tier: planTier,
+          target_plan_code: planCode,
+          target_expected_branch_count: branchCount,
+          target_previous_reference: reference,
+        });
+        if (replacementError || replacement !== true) {
+          return respond("The previous checkout changed while retrying. Reload billing and try again.", 409);
+        }
+        reference = replacementReference;
+      }
+    } catch {
+      // A verify timeout is not proof that the previous charge failed. Keep and reuse its reference.
+    }
+  } else {
+    reference = `lokalledger-${crypto.randomUUID()}`;
+    const startedAt = new Date().toISOString();
+    const { data: pendingRow, error: pendingError } = await admin.rpc("reserve_owner_subscription_checkout", {
+      target_owner_id: authData.user.id,
+      target_reference: reference,
+      target_started_at: startedAt,
+      target_email: authData.user.email,
+      target_plan_tier: planTier,
+      target_plan_code: planCode,
+      target_expected_branch_count: branchCount,
+      target_previous_reference: null,
+    });
+    if (pendingError) return respond("Could not prepare your billing checkout. Try again shortly.", 503);
+    if (pendingRow !== true) return respond("Branch count or subscription status changed. Refresh billing and choose the current plan.", 409);
   }
 
   try {
     const callbackUrl = new URL("/api/billing/callback", request.url).toString();
-    const result = await callPaystack<{ status: boolean; message: string; data?: Record<string, unknown> }>(
-      "/transaction/initialize",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          email: authData.user.email,
-          amount: String(amountKobo),
-          currency: "NGN",
-          reference,
-          callback_url: callbackUrl,
-          metadata: {
-            owner_id: authData.user.id,
-            plan_tier: tier,
-            billing_mode: mode,
-          },
-          ...(planCode ? { plan: planCode } : {}),
-        }),
+    const checkout = await paystackRequest("/transaction/initialize", secret, {
+      email: authData.user.email,
+      amount: String(PLAN_AMOUNTS_KOBO[planTier]),
+      currency: "NGN",
+      plan: planCode,
+      reference,
+      callback_url: callbackUrl,
+      metadata: {
+        owner_id: authData.user.id,
+        business_id: body.businessId,
+        plan_tier: planTier,
+        branch_count: branchCount,
       },
-    );
-    const authorizationUrl = getString(result.data?.authorization_url);
-    if (!authorizationUrl) {
-      return respond("Paystack did not return a checkout link. Try again shortly.", 502);
+    });
+    const authorizationUrl = checkout.authorization_url;
+    if (!isPaystackAuthorizationUrl(authorizationUrl)) {
+      return respond("Paystack returned no safe checkout link. The same checkout reference has been preserved; retry before starting another payment.", 502);
     }
-    const checkoutUrl = new URL(authorizationUrl);
-    if (checkoutUrl.protocol !== "https:" || !checkoutUrl.hostname.endsWith("paystack.com")) {
-      return respond("Paystack returned an invalid checkout link.", 502);
+    const { error: saveUrlError } = await admin
+      .from("owner_subscriptions")
+      .update({ checkout_url: authorizationUrl, updated_at: new Date().toISOString() })
+      .eq("owner_id", authData.user.id)
+      .eq("checkout_reference", reference);
+    if (saveUrlError) {
+      // The reference is still reserved, so this hosted link can be used without risking another transaction.
+      return Response.json({ authorizationUrl }, { headers: responseHeaders });
     }
-    return Response.json({ authorizationUrl: checkoutUrl.toString() }, { headers: responseHeaders });
-  } catch (reason) {
-    const message = reason instanceof Error ? reason.message : "Paystack could not start checkout.";
-    const { error: cleanupError } = await admin.from("subscription_checkouts").delete().eq("reference", reference);
-    if (cleanupError) {
-      return respond("Paystack checkout failed, and its pending reference could not be cleared. Contact support before retrying.", 503);
-    }
-    return respond(message, 502);
+    return Response.json({ authorizationUrl }, { headers: responseHeaders });
+  } catch {
+    return respond("Paystack could not finish this checkout attempt. Its reference is preserved; retry this same checkout before starting another payment. If you already opened Paystack, continue there.", 502);
   }
 }

@@ -2600,3 +2600,32 @@ td strong {
   .service-customer-help { grid-column: 1; }
   .service-actions { min-width: 210px; }
 }
+
+.billing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+.billing-card h2 {
+  margin: 7px 0 9px;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 680;
+}
+.billing-card p {
+  margin: 7px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.billing-card .billing-status {
+  color: var(--green-dark);
+  font-weight: 680;
+}
+.billing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}

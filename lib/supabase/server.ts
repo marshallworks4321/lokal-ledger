@@ -2,9 +2,9 @@ import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 import { authCookieOptions, getSupabaseConfig } from "@/lib/supabase/client";
 
-export async function createAuthenticatedServerClient() {
+export async function createRequestClient() {
   const config = getSupabaseConfig();
-  if (!config) throw new Error("Supabase authentication is not configured on this server.");
+  if (!config) return null;
 
   const cookieStore = await cookies();
   return createServerClient(config.url, config.publishableKey, {
@@ -14,7 +14,9 @@ export async function createAuthenticatedServerClient() {
         return cookieStore.getAll();
       },
       setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value, options }) => cookieStore.set(name, value, options));
+        cookiesToSet.forEach(({ name, value, options }) => {
+          cookieStore.set(name, value, options);
+        });
       },
     },
   });
