@@ -108,6 +108,10 @@ export async function POST(request: Request) {
   if (authError) return respond("Could not verify your Supabase session. Try again.", 503);
   if (!authData.user) return respond("Sign in to generate business insights.", 401);
 
+  const { data: subscriptionAllowed, error: subscriptionError } = await supabase.rpc("current_user_has_active_subscription");
+  if (subscriptionError) return respond("Could not verify your trial or subscription. Apply the latest billing migration and try again.", 503);
+  if (subscriptionAllowed !== true) return respond("Your free trial has ended. The business owner must subscribe before generating insights.", 402);
+
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return respond("Gemini insights are not configured. Add GEMINI_API_KEY to the server environment.", 503);
   const model = process.env.GEMINI_MODEL?.trim() || "gemini-3.8-flash";
@@ -194,9 +198,8 @@ export async function POST(request: Request) {
     return respond("Gemini did not return business insights.", 502);
   }
   const text = candidate.content.parts
-    .filter(isRecord)
-    .map((part) => part.text)
-    .find((part): part is string => typeof part === "string");
+    .flatMap((part) => isRecord(part) && typeof part.text === "string" && part.thought !== true ? [part.text] : [])
+    .join("");
   if (!text) return respond("Gemini returned an empty insight response.", 502);
 
   let parsed: unknown;

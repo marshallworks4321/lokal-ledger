@@ -43,7 +43,20 @@ import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from "re
 import type { SupabaseClient, User } from "@supabase/supabase-js";
 import { createClient, getSupabaseConfig } from "@/lib/supabase/client";
 
-type Business = { id: string; name: string };
+type Business = { id: string; name: string; ownerId: string };
+type SubscriptionSummary = {
+  businessId: string;
+  ownerId: string;
+  status: "trialing" | "active" | "past_due" | "canceled";
+  trialStartedAt: string;
+  trialEndsAt: string;
+  planTier: "single" | "multi" | null;
+  nextPaymentDate: string | null;
+  cancelAtPeriodEnd: boolean;
+  branchCount: number;
+  hasAccess: boolean;
+  canManage: boolean;
+};
 type Location = { id: string; businessId: string; name: string };
 type StockItem = {
   id: string;
@@ -184,8 +197,9 @@ type Workspace = {
   repayments: RepaymentRecord[];
   transactions: Transaction[];
   insightsByLocation: Record<string, BusinessInsights>;
+  subscriptionSummaries: SubscriptionSummary[];
 };
-type View = "Overview" | "Inventory" | "Locations" | "Customers" | "Service log" | "Credit ledger" | "Insights";
+type View = "Overview" | "Inventory" | "Locations" | "Customers" | "Service log" | "Credit ledger" | "Insights" | "Subscription";
 type SpeechRecognitionLike = {
   lang: string;
   interimResults: boolean;
@@ -215,6 +229,7 @@ const blankWorkspace: Workspace = {
   repayments: [],
   transactions: [],
   insightsByLocation: {},
+  subscriptionSummaries: [],
 };
 
 function localDateInputValue(date: Date) {
@@ -349,12 +364,37 @@ function findInventoryMatch(name: string, inventory: StockItem[]) {
 }
 
 async function loadWorkspace(client: SupabaseClient): Promise<Workspace> {
-  const businessResult = await client.from("businesses").select("id, name").order("created_at");
+  const businessResult = await client.from("businesses").select("id, name, owner_id").order("created_at");
   if (businessResult.error) throw businessResult.error;
-  const businesses: Business[] = businessResult.data;
+  const businesses: Business[] = businessResult.data.map((business) => ({
+    id: business.id,
+    name: business.name,
+    ownerId: business.owner_id,
+  }));
   if (businesses.length === 0) return blankWorkspace;
 
   const businessIds = businesses.map((business) => business.id);
+  const subscriptionSummaries = (await Promise.all(businesses.map(async (business) => {
+    const { data, error } = await client.rpc("get_business_subscription_summary", {
+      target_business_id: business.id,
+    });
+    if (error) throw error;
+    const row = Array.isArray(data) ? data[0] : null;
+    if (!row) return null;
+    return {
+      businessId: business.id,
+      ownerId: String(row.owner_id),
+      status: row.status as SubscriptionSummary["status"],
+      trialStartedAt: String(row.trial_started_at),
+      trialEndsAt: String(row.trial_ends_at),
+      planTier: row.plan_tier === "single" || row.plan_tier === "multi" ? row.plan_tier : null,
+      nextPaymentDate: typeof row.next_payment_date === "string" ? row.next_payment_date : null,
+      cancelAtPeriodEnd: row.cancel_at_period_end === true,
+      branchCount: Number(row.branch_count),
+      hasAccess: row.has_access === true,
+      canManage: row.can_manage === true,
+    } satisfies SubscriptionSummary;
+  }))).filter((summary): summary is SubscriptionSummary => summary !== null);
   const locationResult = await client
     .from("locations")
     .select("id, business_id, name")
@@ -380,7 +420,7 @@ async function loadWorkspace(client: SupabaseClient): Promise<Workspace> {
     notes: customer.notes,
   }));
   if (locations.length === 0) {
-    return { ...blankWorkspace, businesses, locations, customers };
+    return { ...blankWorkspace, businesses, locations, customers, subscriptionSummaries };
   }
 
   const locationById = new Map(locations.map((location) => [location.id, location]));
@@ -662,6 +702,7 @@ async function loadWorkspace(client: SupabaseClient): Promise<Workspace> {
     repayments,
     transactions,
     insightsByLocation,
+    subscriptionSummaries,
   };
 }
 
@@ -672,6 +713,7 @@ export default function LedgerWorkspace() {
   const [workspaceLoadedFor, setWorkspaceLoadedFor] = useState<string | null>(null);
   const [workspaceLoadError, setWorkspaceLoadError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [billingBusy, setBillingBusy] = useState(false);
   const [workspaceVersion, setWorkspaceVersion] = useState(0);
   const [workspace, setWorkspace] = useState<Workspace>(blankWorkspace);
   const [error, setError] = useState("");
@@ -756,6 +798,21 @@ export default function LedgerWorkspace() {
   }, []);
 
   useEffect(() => {
+    const billingResult = new URLSearchParams(window.location.search).get("billing");
+    const message = billingResult === "success"
+      ? "Payment verified. Your subscription is active."
+      : billingResult === "processing"
+        ? "Payment received. Subscription confirmation is still processing; refresh this page shortly."
+        : billingResult === "failed"
+          ? "Payment was not confirmed. No subscription access was activated."
+          : "";
+    if (!message) return;
+    const timeout = window.setTimeout(() => setNotice(message), 0);
+    window.history.replaceState({}, "", window.location.pathname);
+    return () => window.clearTimeout(timeout);
+  }, []);
+
+  useEffect(() => {
     if (!getSupabaseConfig()) {
       return;
     }
@@ -833,6 +890,8 @@ export default function LedgerWorkspace() {
         const message = getErrorMessage(reason);
         setWorkspaceLoadError(message.includes("service_job_payments")
           ? "We couldn’t load repayment history because the latest database permissions are not installed. Run supabase/migrations/20261028030000_manual_followups_and_repayment_history.sql in the Supabase SQL Editor, then retry."
+          : message.includes("get_business_subscription_summary")
+            ? "Subscription setup is not installed. Run supabase/migrations/20261029120000_owner_subscriptions.sql in the Supabase SQL Editor, then retry."
           : ["average_cost", "unit_cost", "reorder_level"].some((column) => message.includes(column))
             ? "Inventory cost and stock-watch fields are not installed. Run supabase/migrations/20261028040000_cost_controls_and_stock_watch.sql in the Supabase SQL Editor, then retry."
           : `We couldn’t load your business data. ${message}`);
@@ -850,6 +909,10 @@ export default function LedgerWorkspace() {
   const businessById = useMemo(
     () => new Map(workspace.businesses.map((business) => [business.id, business])),
     [workspace.businesses],
+  );
+  const ownerSubscriptionSummaries = useMemo(
+    () => [...new Map(workspace.subscriptionSummaries.map((summary) => [summary.ownerId, summary])).values()],
+    [workspace.subscriptionSummaries],
   );
   const serviceCustomers = workspace.customers.filter(
     (customer) => customer.businessId === locationById.get(serviceLocationId)?.businessId,
@@ -1001,6 +1064,63 @@ export default function LedgerWorkspace() {
     if (!supabase) return;
     const { error: signoutError } = await supabase.auth.signOut();
     if (signoutError) setError(`Could not sign out: ${signoutError.message}`);
+  }
+
+  async function beginSubscription(businessId: string, planTier: "single" | "multi") {
+    if (billingBusy) return;
+    setBillingBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/billing/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ businessId, planTier }),
+      });
+      const result: unknown = await response.json();
+      if (!response.ok || typeof result !== "object" || result === null || !("authorizationUrl" in result)) {
+        const message = typeof result === "object" && result !== null && "message" in result && typeof result.message === "string"
+          ? result.message
+          : "Could not start Paystack checkout.";
+        throw new Error(message);
+      }
+      const authorizationUrl = (result as { authorizationUrl: unknown }).authorizationUrl;
+      if (typeof authorizationUrl !== "string") throw new Error("Paystack did not return a checkout link.");
+      window.location.assign(authorizationUrl);
+    } catch (reason) {
+      setError(`Could not start subscription: ${getErrorMessage(reason)}`);
+      setBillingBusy(false);
+    }
+  }
+
+  async function cancelSubscription(businessId: string, pastDue = false) {
+    if (billingBusy) return;
+    const accepted = window.confirm(pastDue
+      ? "Stop this failed subscription so the owner can start a fresh checkout? Access remains paused until a new payment succeeds."
+      : "Stop future monthly renewals? Access will continue until the current paid period ends.");
+    if (!accepted) return;
+    setBillingBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/billing/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ businessId }),
+      });
+      const result: unknown = await response.json();
+      if (!response.ok) {
+        const message = typeof result === "object" && result !== null && "message" in result && typeof result.message === "string"
+          ? result.message
+          : "Paystack could not cancel the renewal.";
+        throw new Error(message);
+      }
+      setWorkspaceLoadedFor(null);
+      setWorkspaceVersion((version) => version + 1);
+      flash("Renewal cancellation requested. Access remains available through the paid period.");
+    } catch (reason) {
+      setError(`Could not cancel renewal: ${getErrorMessage(reason)}`);
+    } finally {
+      setBillingBusy(false);
+    }
   }
 
   function retryWorkspaceLoad() {
@@ -2061,6 +2181,7 @@ export default function LedgerWorkspace() {
     { label: "Service log", icon: ClipboardList },
     { label: "Credit ledger", icon: CreditCard },
     { label: "Insights", icon: BarChart3 },
+    { label: "Subscription", icon: Wallet },
   ];
 
   return (
@@ -2434,6 +2555,61 @@ export default function LedgerWorkspace() {
               <MetricCard title="Estimated product gross profit" value={formatNaira(estimatedProductProfit)} change={`${selectedInsights.salesLinesWithoutCost} sales lines lack recorded cost; excludes other expenses`} icon={<TrendingUp size={18} />} tone="green" />
               <MetricCard title="Inventory at recorded cost" value={formatNaira(selectedInsights.inventoryValueAtCost)} change={`${selectedInsights.inventoryProductsWithCost} products have recorded restock costs`} icon={<Package size={18} />} tone="violet" />
             </div>
+          </>}
+
+          {view === "Subscription" && <>
+            <div className="page-heading"><div><div className="eyebrow">TRIAL AND MONTHLY PLAN</div><h1>Subscription</h1><p>Three weeks free, then pay in Nigerian naira through Paystack.</p></div><span className="insight-badge"><CreditCard size={14} /> NGN billing</span></div>
+            {ownerSubscriptionSummaries.length === 0 && <section className="panel billing-card"><h2>No subscription status found</h2><p>Apply the latest subscription migration, then reload your workspace.</p></section>}
+            <div className="billing-grid">
+              {ownerSubscriptionSummaries.map((subscription) => {
+                const accountBusinesses = workspace.businesses.filter((business) => business.ownerId === subscription.ownerId);
+                const businessId = accountBusinesses[0]?.id;
+                const trialActive = subscription.status === "trialing" && subscription.hasAccess;
+                const paidActive = subscription.status === "active" && subscription.hasAccess;
+                const endedCanceledPeriod = subscription.status === "active" && subscription.cancelAtPeriodEnd &&
+                  !subscription.hasAccess;
+                const planTier = paidActive && subscription.planTier
+                  ? subscription.planTier
+                  : subscription.branchCount > 1
+                    ? "multi"
+                    : "single";
+                const monthlyPrice = planTier === "single" ? 3000 : 5000;
+                const formattedTrialEnd = new Date(subscription.trialEndsAt).toLocaleDateString("en-NG", {
+                  day: "numeric", month: "long", year: "numeric",
+                });
+                const relatedNames = accountBusinesses.map((business) => business.name).join(", ");
+                return <section key={subscription.ownerId} className="panel billing-card">
+                  <div className="eyebrow">{subscription.canManage ? "YOUR ACCOUNT" : "BUSINESS OWNER'S ACCOUNT"}</div>
+                  <h2>{relatedNames || "Business subscription"}</h2>
+                  <p className="billing-status">{trialActive
+                    ? `Free trial · ends ${formattedTrialEnd}`
+                    : paidActive
+                      ? `Active · ${subscription.planTier === "single" ? "one branch" : "multiple branches"} plan`
+                      : subscription.status === "past_due"
+                      ? "Payment needs attention"
+                      : subscription.status === "canceled"
+                        ? "Subscription canceled"
+                        : endedCanceledPeriod
+                          ? "Paid period ended"
+                          : "Free trial ended"}</p>
+                  <p>{subscription.branchCount} {subscription.branchCount === 1 ? "branch" : "branches"} across this owner&apos;s businesses. The applicable plan is <strong>₦{monthlyPrice.toLocaleString("en-NG")}/month</strong>.</p>
+                  {subscription.branchCount === 0 && <p>Create a first location before checkout; pricing is ₦3,000 for one branch or ₦5,000 for two or more.</p>}
+                  {paidActive && subscription.nextPaymentDate && <p>Next renewal: {new Date(subscription.nextPaymentDate).toLocaleDateString("en-NG", { day: "numeric", month: "long", year: "numeric" })}.</p>}
+                  {paidActive && subscription.planTier === "single" && <p>The one-branch plan is limited to one location. Multi-branch pricing applies only after two or more locations are registered.</p>}
+                  {subscription.cancelAtPeriodEnd && <p>Renewal is canceled. Access remains until the current paid period ends.</p>}
+                  {trialActive && <p>No payment is taken during the trial. When it ends, the owner chooses whether to start the monthly subscription.</p>}
+                  {subscription.status === "past_due" && <p>To restart billing, stop the failed plan first, then complete a new Paystack checkout.</p>}
+                  {!subscription.hasAccess && <p>Existing records remain readable. New changes and AI requests pause until the owner subscribes.</p>}
+                  {!subscription.canManage && <p>Only the business owner can start or cancel billing.</p>}
+                  <div className="billing-actions">
+                    {subscription.canManage && subscription.branchCount > 0 && !subscription.hasAccess && (subscription.status === "trialing" || subscription.status === "canceled" || endedCanceledPeriod) && businessId && <button className="button button-primary" type="button" onClick={() => void beginSubscription(businessId, subscription.branchCount === 1 ? "single" : "multi")} disabled={billingBusy}>{billingBusy ? "Opening checkout…" : subscription.branchCount === 1 ? "One branch · ₦3,000/month" : "Multiple branches · ₦5,000/month"}</button>}
+                    {subscription.canManage && paidActive && !subscription.cancelAtPeriodEnd && businessId && <button className="button button-secondary" type="button" onClick={() => void cancelSubscription(businessId)} disabled={billingBusy}>{billingBusy ? "Updating…" : "Cancel renewal"}</button>}
+                    {subscription.canManage && subscription.status === "past_due" && businessId && <button className="button button-secondary" type="button" onClick={() => void cancelSubscription(businessId, true)} disabled={billingBusy}>{billingBusy ? "Updating…" : "Stop failed plan"}</button>}
+                  </div>
+                </section>;
+              })}
+            </div>
+            <div className="reminder-notice"><ShieldCheck size={17} /><span><strong>Payment safety.</strong><br />Checkout is hosted by Paystack. Your card details are not stored by Lokal Ledger. No payment is taken until an owner opens checkout and completes it.</span></div>
           </>}
         </div>
       </main>
