@@ -114,7 +114,7 @@ export async function POST(request: Request) {
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return respond("Gemini insights are not configured. Add GEMINI_API_KEY to the server environment.", 503);
-  const model = process.env.GEMINI_MODEL?.trim() || "gemini-3.8-flash";
+  const model = process.env.GEMINI_MODEL?.trim() || "gemini-1.5-flash";
   if (!/^gemini-[a-z0-9.-]+$/i.test(model)) {
     return respond("GEMINI_MODEL must be a valid Gemini model ID.", 503);
   }

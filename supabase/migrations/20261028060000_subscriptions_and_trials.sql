@@ -1,4 +1,4 @@
-create table if not exists public.account_subscriptions (
+create table if not exists public.owner_subscriptions (
   owner_id uuid primary key references auth.users (id) on delete cascade,
   trial_started_at timestamptz not null,
   trial_ends_at timestamptz not null,
@@ -39,33 +39,33 @@ create table if not exists public.paystack_subscription_secrets (
   updated_at timestamptz not null default now()
 );
 
-grant all on public.account_subscriptions to service_role;
+grant all on public.owner_subscriptions to service_role;
 grant all on public.subscription_checkouts to service_role;
 grant all on public.subscription_payments to service_role;
 grant all on public.paystack_subscription_secrets to service_role;
 
-alter table public.account_subscriptions enable row level security;
+alter table public.owner_subscriptions enable row level security;
 alter table public.subscription_checkouts enable row level security;
 alter table public.subscription_payments enable row level security;
 alter table public.paystack_subscription_secrets enable row level security;
 
-revoke all on public.account_subscriptions from public, anon, authenticated;
+revoke all on public.owner_subscriptions from public, anon, authenticated;
 revoke all on public.subscription_checkouts from public, anon, authenticated;
 revoke all on public.subscription_payments from public, anon, authenticated;
 revoke all on public.paystack_subscription_secrets from public, anon, authenticated;
 
-grant select on public.account_subscriptions to authenticated;
+grant select on public.owner_subscriptions to authenticated;
 grant select on public.subscription_payments to authenticated;
 
 create policy "Owners can read their subscription"
-  on public.account_subscriptions for select to authenticated
+  on public.owner_subscriptions for select to authenticated
   using (owner_id = (select auth.uid()));
 
 create policy "Owners can read their subscription payments"
   on public.subscription_payments for select to authenticated
   using (owner_id = (select auth.uid()));
 
-insert into public.account_subscriptions (
+insert into public.owner_subscriptions (
   owner_id,
   trial_started_at,
   trial_ends_at
@@ -85,7 +85,7 @@ security definer
 set search_path = ''
 as $$
 declare
-  subscription_row public.account_subscriptions%rowtype;
+  subscription_row public.owner_subscriptions%rowtype;
   owned_business_count integer;
   trial_active boolean;
   paid_active boolean;
@@ -99,7 +99,7 @@ begin
   where owner_id = auth.uid();
 
   select * into subscription_row
-  from public.account_subscriptions
+  from public.owner_subscriptions
   where owner_id = auth.uid();
 
   if not found then
@@ -147,7 +147,7 @@ set search_path = ''
 as $$
 declare
   business_owner_id uuid;
-  subscription_row public.account_subscriptions%rowtype;
+  subscription_row public.owner_subscriptions%rowtype;
   business_count integer;
   target_business_id uuid;
 begin
@@ -163,7 +163,7 @@ begin
         raise exception 'You can only create a business for your own account.';
       end if;
 
-      insert into public.account_subscriptions (
+      insert into public.owner_subscriptions (
         owner_id,
         trial_started_at,
         trial_ends_at
@@ -192,7 +192,7 @@ begin
   end if;
 
   select * into subscription_row
-  from public.account_subscriptions
+  from public.owner_subscriptions
   where owner_id = business_owner_id
   for update;
 
@@ -319,11 +319,11 @@ begin
   end if;
 
   select access_until into current_access_until
-  from public.account_subscriptions
+  from public.owner_subscriptions
   where owner_id = target_owner_id
   for update;
 
-  update public.account_subscriptions
+  update public.owner_subscriptions
   set access_until = greatest(coalesce(current_access_until, now()), now()) + interval '30 days',
       plan_tier = checkout_row.plan_tier,
       billing_mode = checkout_row.billing_mode,
@@ -377,7 +377,7 @@ security definer
 set search_path = ''
 as $$
 declare
-  subscription_row public.account_subscriptions%rowtype;
+  subscription_row public.owner_subscriptions%rowtype;
   expected_amount integer;
   inserted_reference text;
 begin
@@ -386,7 +386,7 @@ begin
   end if;
 
   select * into subscription_row
-  from public.account_subscriptions
+  from public.owner_subscriptions
   where owner_id = target_owner_id
   for update;
 
@@ -420,7 +420,7 @@ begin
     return false;
   end if;
 
-  update public.account_subscriptions
+  update public.owner_subscriptions
   set access_until = greatest(coalesce(access_until, now()), now()) + interval '30 days',
       paystack_customer_code = coalesce(nullif(verified_customer_code, ''), paystack_customer_code),
       auto_renew = true,
