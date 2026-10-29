@@ -1,6 +1,6 @@
 # Lokal Ledger
 
-Built as a capstone project for SMEs and service-based businesses, Lokal Ledger is an early, browser-based prototype for helping small merchants keep track of stock, sales, and customer credit across business locations. It is designed to grow into a dependable product, rather than remain only a presentation.
+Built as a capstone project for SMEs and service-based businesses, Lokal Ledger is an early, browser-based prototype for helping small merchants keep track of stock, sales, and customer credit across business locations. It is designed to grow into a dependable product, rather than remain only a presentation in view to transend to mobile application.
 
 ## Run it in VS Code
 
